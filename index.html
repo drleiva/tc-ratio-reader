@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>T/C Ratio Reader (Private)</title>
+<style>
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    margin: 0;
+    padding: 12px;
+    background: #f7f7f7;
+  }
+  h2 { margin-top: 0; }
+  canvas {
+    max-width: 100%;
+    border: 1px solid #ccc;
+    touch-action: none;
+    background: white;
+  }
+  .controls {
+    margin: 10px 0;
+  }
+  button {
+    padding: 10px 14px;
+    font-size: 16px;
+    margin-right: 8px;
+  }
+  .result {
+    margin-top: 12px;
+    padding: 10px;
+    background: #fff;
+    border-radius: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.1);
+  }
+</style>
+</head>
+
+<body>
+<h2>T/C Ratio Reader (Private)</h2>
+
+<input type="file" accept="image/*" id="fileInput">
+
+<canvas id="canvas"></canvas>
+
+<div class="controls">
+  <button onclick="computeRatio()">Compute T/C Ratio</button>
+</div>
+
+<div class="result" id="output">
+  Load an image, adjust the box over the test window, then tap “Compute”.
+</div>
+
+<script>
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const fileInput = document.getElementById("fileInput");
+const output = document.getElementById("output");
+
+let img = new Image();
+
+// Simple movable ROI box
+let roi = { x: 50, y: 50, w: 200, h: 120 };
+let dragging = false;
+
+fileInput.addEventListener("change", e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  img.onload = () => {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    roi = {
+      x: img.width * 0.2,
+      y: img.height * 0.3,
+      w: img.width * 0.6,
+      h: img.height * 0.25
+    };
+    draw();
+  };
+  img.src = URL.createObjectURL(file);
+});
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(img,0,0);
+  ctx.strokeStyle = "red";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left;
+  const y = e.clientY - r.top;
+  if (x > roi.x && x < roi.x+roi.w && y > roi.y && y < roi.y+roi.h) {
+    dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const r = canvas.getBoundingClientRect();
+  roi.x = e.clientX - r.left - roi.w/2;
+  roi.y = e.clientY - r.top - roi.h/2;
+  roi.x = Math.max(0, Math.min(roi.x, canvas.width-roi.w));
+  roi.y = Math.max(0, Math.min(roi.y, canvas.height-roi.h));
+  draw();
+});
+
+canvas.addEventListener("pointerup", () => dragging = false);
+
+function computeRatio() {
+  if (!img.src) return;
+
+  // Extract ROI
+  const roiData = ctx.getImageData(roi.x, roi.y, roi.w, roi.h);
+  const w = roiData.width;
+  const h = roiData.height;
+  const d = roiData.data;
+
+  // Convert to grayscale
+  let gray = new Array(w*h);
+  for (let i=0; i<w*h; i++) {
+    const r = d[i*4], g = d[i*4+1], b = d[i*4+2];
+    gray[i] = 0.299*r + 0.587*g + 0.114*b;
+  }
+
+  // Row darkness profile
+  let darkness = new Array(h).fill(0);
+  for (let y=0; y<h; y++) {
+    let sum = 0, n = 0;
+    for (let x=Math.floor(w*0.2); x<Math.floor(w*0.8); x++) {
+      sum += gray[y*w+x];
+      n++;
+    }
+    let mean = sum/n;
+    darkness[y] = 255 - mean;
+  }
+
+  // Smooth
+  for (let i=2; i<h-2; i++) {
+    darkness[i] = (darkness[i-2]+darkness[i-1]+darkness[i]+darkness[i+1]+darkness[i+2])/5;
+  }
+
+  // Find two strongest peaks
+  let peaks = [];
+  for (let i=1; i<h-1; i++) {
+    if (darkness[i] > darkness[i-1] && darkness[i] > darkness[i+1]) {
+      peaks.push({y:i, v:darkness[i]});
+    }
+  }
+  peaks.sort((a,b)=>b.v-a.v);
+  if (peaks.length < 2) {
+    output.innerHTML = "Could not detect two lines.";
+    return;
+  }
+
+  let y1 = peaks[0].y;
+  let y2 = peaks[1].y;
+  let cY = Math.min(y1,y2);
+  let tY = Math.max(y1,y2);
+
+  function bandMean(yc) {
+    let sum=0, n=0;
+    for (let y=Math.max(0,yc-3); y<=Math.min(h-1,yc+3); y++) {
+      for (let x=Math.floor(w*0.2); x<Math.floor(w*0.8); x++) {
+        sum += gray[y*w+x];
+        n++;
+      }
+    }
+    return sum/n;
+  }
+
+  const T = bandMean(tY);
+  const C = bandMean(cY);
+
+  // Background from top & bottom
+  let bgSum=0, bgN=0;
+  for (let y=0; y<Math.floor(h*0.15); y++) {
+    for (let x=Math.floor(w*0.2); x<Math.floor(w*0.8); x++) {
+      bgSum += gray[y*w+x];
+      bgN++;
+    }
+  }
+  for (let y=Math.floor(h*0.85); y<h; y++) {
+    for (let x=Math.floor(w*0.2); x<Math.floor(w*0.8); x++) {
+      bgSum += gray[y*w+x];
+      bgN++;
+    }
+  }
+  const BG = bgSum/bgN;
+
+  const dT = Math.max(0, BG - T);
+  const dC = Math.max(0, BG - C);
+  const ratio = dC>1 ? (dT/dC) : 0;
+
+  output.innerHTML =
+    `<b>T/C ratio:</b> ${ratio.toFixed(2)}<br>
+     <small>(T darker = higher ratio)</small>`;
+}
+</script>
+</body>
+</html>
